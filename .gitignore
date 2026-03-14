@@ -1,13 +1,13 @@
 ## .NET
 bin/
 obj/
+Properties/
 *.user
 *.rsuser
 
 ## IDE
 .vs/
 .idea/
-Properties/
 *.suo
 
 ## Тестовые данные (BLOB-дампы, аудио)
