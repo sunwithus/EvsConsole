@@ -32,7 +32,7 @@ EvsConsole/
 ├── Program.cs          # Основной код приложения
 ├── EvsConsole.csproj   # Файл проекта .NET
 ├── evs_dec.exe         # EVS-декодер (3GPP TS 26.443)
-├── EVS_cod.exe         # EVS-энкодер (3GPP TS 26.443)
+├── evs_cod.exe         # EVS-энкодер (3GPP TS 26.443)
 ├── c-code/             # Исходный код 3GPP EVS Codec
 └── README.md
 ```
@@ -131,7 +131,7 @@ EvsConsole --probe data_file.bin
 | `-c`, `--encode [bitrate]`  | Режим кодирования WAV → EVS |
 | `-b`, `--bitrate <bps>`     | Битрейт: 7200-128000 bps (по умолчанию: 24400) |
 | `--format <g192\|mime>` | Выходной формат: G.192 или MIME (по умолчанию: g192) |
-| `-e`, `--encoder <путь>`    | Путь к `EVS_cod.exe` |
+| `-e`, `--encoder <путь>`    | Путь к `evs_cod.exe` |
 | **Общие** | |
 | `-p`, `--probe`             | Анализ структуры файла без декодирования |
 | `-q`, `--quiet`             | Минимальный вывод (только ошибки и результат) |
@@ -245,7 +245,7 @@ Word16  Nth Bit
 ```
 ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐     ┌──────────┐
 │  Входной     │     │ Парсинг         │     │  Downmix     │     │ evs_enc/ │
-│  WAV файл    │───▶│ WAV заголовка   │────▶│  (если stereo)│───▶│ EVS_cod  │
+│  WAV файл    │───▶│ WAV заголовка   │────▶│  (если stereo)│───▶│ evs_cod  │
 │              │     │ (PCM, rate, ch) │     │              │     │ .exe     │
 └──────────────┘     └─────────────────┘     └──────────────┘     └────┬─────┘
                                                                        │ EVS
@@ -260,7 +260,7 @@ Word16  Nth Bit
 1. Чтение WAV файла, проверка формата (PCM 16-bit)
 2. Извлечение PCM данных, sample rate, channel count из заголовка
 3. Downmix stereo в mono (усреднение каналов)
-4. Вызов `EVS_cod.exe` с PCM данными → получение EVS bitstream
+4. Вызов `evs_cod.exe` с PCM данными → получение EVS bitstream
 5. Запись EVS файла в формате G.192 или MIME
 
 ## Пример вывода
@@ -280,7 +280,7 @@ OK
 
 ### Кодирование
 ```
-Encoder: d:\EvsConsole\EVS_cod.exe
+Encoder: d:\EvsConsole\evs_cod.exe
 Вход: audio.wav (442 044 байт)
 Формат: wav-pcm
 Выход: audio.evs (428 188 байт, 00:13.8)
