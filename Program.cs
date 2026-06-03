@@ -30,7 +30,8 @@ class Program
         bool probeMode = false;
         bool encodeMode = false;
         int encodeBitrate = 24400; // default 24.4 kbps
-        string? encodeFormat = null; // "g192" or "mime"
+        string? encodeFormat = null; // "g192", "mime" or "toc"
+        bool? enableDtx = null; // null = авто (вкл. для --format toc)
         var positional = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
@@ -67,8 +68,15 @@ class Program
                 case "--format":
                     if (++i >= args.Length) { Error("Не указан формат"); return 1; }
                     encodeFormat = args[i].ToLowerInvariant();
-                    if (encodeFormat is not ("g192" or "mime"))
-                    { Error("Формат: g192 или mime"); return 1; }
+                    if (encodeFormat is not ("g192" or "mime" or "toc" or "evs-toc"))
+                    { Error("Формат: g192, mime или toc"); return 1; }
+                    if (encodeFormat == "evs-toc") encodeFormat = "toc";
+                    break;
+                case "--dtx":
+                    enableDtx = true;
+                    break;
+                case "--no-dtx":
+                    enableDtx = false;
                     break;
                 case "-w" or "--whisper": sampleRateKhz = 16; break;
                 case "-q" or "--quiet": quiet = true; break;
@@ -96,7 +104,7 @@ class Program
                 return EncodeDirectory(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, quiet, keepTemp);
 
             outPath ??= Path.ChangeExtension(inputPath, ".evs");
-            return EncodeFile(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, quiet, keepTemp);
+            return EncodeFile(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, enableDtx, quiet, keepTemp);
         }
 
         // Decode mode: EVS -> WAV
@@ -439,13 +447,13 @@ class Program
         {
             string evsPath = Path.Combine(outputDir, Path.GetFileNameWithoutExtension(file) + ".evs");
             Console.WriteLine($"\n--- {Path.GetFileName(file)} ---");
-            if (EncodeFile(file, evsPath, sampleRateKhz, bitrate, format, quiet, keepTemp) == 0) ok++; else fail++;
+            if (EncodeFile(file, evsPath, sampleRateKhz, bitrate, format, null, quiet, keepTemp) == 0) ok++; else fail++;
         }
         Console.WriteLine($"\nИтого: {ok} OK, {fail} ошибок из {files.Count}");
         return fail > 0 ? 1 : 0;
     }
 
-    static int EncodeFile(string inputPath, string outputPath, int sampleRateKhz, int bitrate, string? format, bool quiet, bool keepTemp)
+    static int EncodeFile(string inputPath, string outputPath, int sampleRateKhz, int bitrate, string? format, bool? enableDtx, bool quiet, bool keepTemp)
     {
         if (!File.Exists(inputPath)) { Error($"Файл не найден: {inputPath}"); return 1; }
 
@@ -481,8 +489,22 @@ class Program
                 pcmData = DownmixToMono(pcmData, wavChannels);
             }
 
-            bool useMime = format == "mime";
-            byte[] evsData = RunEncoder(pcmData, fs, bitrate, useMime, keepTemp);
+            string outFmt = format ?? "g192";
+            bool useMime = outFmt is "mime" or "toc";
+            bool useDtx = enableDtx ?? (outFmt == "toc");
+            byte[] evsData = RunEncoder(pcmData, fs, bitrate, useMime, useDtx, keepTemp);
+
+            if (outFmt == "toc")
+            {
+                evsData = ExtractTocFromEncoded(evsData);
+                if (!quiet)
+                {
+                    var (fc, fr) = ParseTocFrames(evsData);
+                    Console.WriteLine($"ToC: {fc} фреймов, {fc * 0.02:F1} с");
+                    foreach (var kv in fr.GroupBy(f => f.Bitrate).OrderByDescending(g => g.Count()))
+                        Console.WriteLine($"  {kv.Key} bps: {kv.Count()}");
+                }
+            }
 
             File.WriteAllBytes(outputPath, evsData);
 
@@ -608,9 +630,40 @@ class Program
     }
 
     /// <summary>
+    /// MIME Storage (#!EVS_MC1.0 + каналы) → сырой поток [ToC][data]… как в Sprut/BLOB.
+    /// </summary>
+    static byte[] ExtractTocFromEncoded(byte[] encoded)
+    {
+        if (IsTocFormat(encoded))
+            return encoded;
+
+        if (encoded.Length >= 15)
+        {
+            string header = Encoding.ASCII.GetString(encoded, 0, Math.Min(encoded.Length, 15));
+            if (header.StartsWith("#!EVS_MC1.0", StringComparison.Ordinal) || header.StartsWith("#!AMR-WB", StringComparison.Ordinal))
+            {
+                int magicEnd = Encoding.ASCII.GetString(encoded).IndexOf('\n', StringComparison.Ordinal);
+                if (magicEnd < 0) magicEnd = header.StartsWith("#!EVS_MC1.0") ? 12 : 9;
+                else magicEnd++;
+
+                int headerLen = magicEnd + 4; // magic line + 4 bytes channel config
+                if (headerLen >= encoded.Length)
+                    throw new Exception("MIME файл слишком короткий");
+
+                byte[] body = encoded[headerLen..];
+                if (!IsTocFormat(body))
+                    throw new Exception("После MIME-заголовка не найден валидный EVS-ToC поток");
+                return body;
+            }
+        }
+
+        throw new Exception("Не удалось извлечь EVS-ToC: ожидался MIME (#!EVS_MC1.0) или готовый ToC поток");
+    }
+
+    /// <summary>
     /// Runs EVS encoder (EVS_cod.exe) and returns encoded bitstream
     /// </summary>
-    static byte[] RunEncoder(byte[] pcmData, int sampleRateKhz, int bitrate, bool useMime, bool keepTemp)
+    static byte[] RunEncoder(byte[] pcmData, int sampleRateKhz, int bitrate, bool useMime, bool enableDtx, bool keepTemp)
     {
         string tmpDir = Path.Combine(Path.GetTempPath(), "EvsConsole");
         Directory.CreateDirectory(tmpDir);
@@ -623,9 +676,14 @@ class Program
         {
             File.WriteAllBytes(inputFile, pcmData);
 
-            var arguments = useMime
-                ? $"-mime -q {bitrate} {sampleRateKhz} \"{inputFile}\" \"{outputFile}\""
-                : $"-q {bitrate} {sampleRateKhz} \"{inputFile}\" \"{outputFile}\"";
+            var encArgs = new List<string>();
+            if (useMime) encArgs.Add("-mime");
+            if (enableDtx) encArgs.Add("-dtx");
+            encArgs.Add($"-q {bitrate}");
+            encArgs.Add(sampleRateKhz.ToString());
+            encArgs.Add($"\"{inputFile}\"");
+            encArgs.Add($"\"{outputFile}\"");
+            string arguments = string.Join(' ', encArgs);
 
             var psi = new ProcessStartInfo
             {
@@ -918,7 +976,9 @@ class Program
           -c, --encode [bitrate]    Режим кодирования WAV -> EVS
           -b, --bitrate <bps>       Битрейт: 7200, 8000, 9600, 13200, 16400, 24400,
                                     32000, 48000, 64000, 96000, 128000 (по умолч.: 24400)
-              --format <g192|mime>  Формат выхода: g192 (по умолч.) или mime
+              --format <g192|mime|toc>  Выход: g192, mime или toc (Sprut BLOB, как test.evs)
+              --dtx                   DTX/SID кадры 2.4 kbit/s (для toc по умолчанию вкл.)
+              --no-dtx                Без DTX
           -e, --encoder <путь>      Путь к EVS_cod.exe
 
         Общие опции:
@@ -951,6 +1011,8 @@ class Program
           EvsConsole --encode audio.wav
           EvsConsole --encode audio.wav output.evs -b 32000
           EvsConsole --encode audio.wav output.evs --format mime
+          EvsConsole --encode audio.wav output.evs --format toc -b 24400
+          EvsConsole --encode audio.wav output.evs -b 24400 --format toc --no-dtx
           EvsConsole --encode recordings/ output_evs/
         """);
 
