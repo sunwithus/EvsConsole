@@ -491,7 +491,9 @@ class Program
 
             string outFmt = format ?? "g192";
             bool useMime = outFmt is "mime" or "toc";
-            bool useDtx = enableDtx ?? (outFmt == "toc");
+            // DTX (-dtx) даёт SID; без нормализации Sprut-парсер часто видит NO_DATA в «нулевых» паузах.
+            // Для --format toc по умолчанию без DTX (как стабильный Sprut 24.4k); SID: явно --dtx.
+            bool useDtx = enableDtx ?? false;
             byte[] evsData = RunEncoder(pcmData, fs, bitrate, useMime, useDtx, keepTemp);
 
             if (outFmt == "toc")
@@ -634,30 +636,53 @@ class Program
     /// </summary>
     static byte[] ExtractTocFromEncoded(byte[] encoded)
     {
-        if (IsTocFormat(encoded))
-            return encoded;
-
-        if (encoded.Length >= 15)
+        // Сначала снимаем MIME-заголовок. Нельзя вызывать IsTocFormat на полном MIME-файле:
+        // ParseTocFrames ресинхронизируется на body и «узнаёт» поток, хотя в начале лежит magic word.
+        if (TryStripMimeStorageHeader(encoded, out byte[] mimeBody))
         {
-            string header = Encoding.ASCII.GetString(encoded, 0, Math.Min(encoded.Length, 15));
-            if (header.StartsWith("#!EVS_MC1.0", StringComparison.Ordinal) || header.StartsWith("#!AMR-WB", StringComparison.Ordinal))
-            {
-                int magicEnd = Encoding.ASCII.GetString(encoded).IndexOf('\n', StringComparison.Ordinal);
-                if (magicEnd < 0) magicEnd = header.StartsWith("#!EVS_MC1.0") ? 12 : 9;
-                else magicEnd++;
-
-                int headerLen = magicEnd + 4; // magic line + 4 bytes channel config
-                if (headerLen >= encoded.Length)
-                    throw new Exception("MIME файл слишком короткий");
-
-                byte[] body = encoded[headerLen..];
-                if (!IsTocFormat(body))
-                    throw new Exception("После MIME-заголовка не найден валидный EVS-ToC поток");
-                return body;
-            }
+            if (!IsTocFormat(mimeBody))
+                throw new Exception("После MIME-заголовка не найден валидный EVS-ToC поток");
+            return NormalizeSprutTocStream(mimeBody);
         }
 
+        if (IsTocFormat(encoded))
+            return NormalizeSprutTocStream(encoded);
+
         throw new Exception("Не удалось извлечь EVS-ToC: ожидался MIME (#!EVS_MC1.0) или готовый ToC поток");
+    }
+
+    static bool TryStripMimeStorageHeader(byte[] encoded, out byte[] body)
+    {
+        body = Array.Empty<byte>();
+        if (encoded.Length < 15) return false;
+
+        string header = Encoding.ASCII.GetString(encoded, 0, Math.Min(encoded.Length, 15));
+        if (!header.StartsWith("#!EVS_MC1.0", StringComparison.Ordinal)
+            && !header.StartsWith("#!AMR-WB", StringComparison.Ordinal))
+            return false;
+
+        int magicEnd = Encoding.ASCII.GetString(encoded).IndexOf('\n', StringComparison.Ordinal);
+        if (magicEnd < 0) magicEnd = header.StartsWith("#!EVS_MC1.0") ? 12 : 9;
+        else magicEnd++;
+
+        int headerLen = magicEnd + 4; // magic line + 4 bytes channel config
+        if (headerLen >= encoded.Length)
+            throw new Exception("MIME файл слишком короткий");
+
+        body = encoded[headerLen..];
+        return true;
+    }
+
+    /// <summary>
+    /// Sprut/QtPostWorks хранит ToC с установленным H-битом (0x46 для 24.4k), MIME body — без него (0x06).
+    /// </summary>
+    static byte[] NormalizeSprutTocStream(byte[] tocStream)
+    {
+        var result = (byte[])tocStream.Clone();
+        var (_, frames) = ParseTocFrames(tocStream);
+        foreach (var f in frames)
+            result[f.Offset] = (byte)((result[f.Offset] & 0x3F) | 0x40);
+        return result;
     }
 
     /// <summary>
@@ -922,18 +947,15 @@ class Program
     static string FindEncoder()
     {
         // First try to find EVS_cod.exe (reference encoder name)
-        foreach (var dir in new[] { AppDomain.CurrentDomain.BaseDirectory, Directory.GetCurrentDirectory() })
+        foreach (var name in new[] { "EVS_cod.exe", "evs_cod.exe", "evs_enc.exe" })
         {
-            string path = Path.Combine(dir, "EVS_cod.exe");
-            if (File.Exists(path)) return path;
+            foreach (var dir in new[] { AppDomain.CurrentDomain.BaseDirectory, Directory.GetCurrentDirectory() })
+            {
+                string path = Path.Combine(dir, name);
+                if (File.Exists(path)) return path;
+            }
         }
-        // Then try evs_enc.exe
-        foreach (var dir in new[] { AppDomain.CurrentDomain.BaseDirectory, Directory.GetCurrentDirectory() })
-        {
-            string path = Path.Combine(dir, "evs_enc.exe");
-            if (File.Exists(path)) return path;
-        }
-        return Path.Combine(Directory.GetCurrentDirectory(), "EVS_cod.exe");
+        return Path.Combine(Directory.GetCurrentDirectory(), "evs_cod.exe");
     }
 
     static void PrintHexDump(byte[] data, int maxBytes)
