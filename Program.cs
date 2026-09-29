@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Text;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
 
 namespace EvsConsole;
 
@@ -18,7 +20,7 @@ class Program
     static string _decoderPath = null!;
     static string? _encoderPath = null;
 
-    static int Main(string[] args)
+    static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
         if (args.Length == 0) { PrintUsage(); return 0; }
@@ -101,10 +103,10 @@ class Program
 
             string? outPath = positional.Count > 1 ? positional[1] : null;
             if (Directory.Exists(inputPath))
-                return EncodeDirectory(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, quiet, keepTemp);
+                return await EncodeDirectoryAsync(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, quiet, keepTemp);
 
             outPath ??= Path.ChangeExtension(inputPath, ".evs");
-            return EncodeFile(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, enableDtx, quiet, keepTemp);
+            return await EncodeFileAsync(inputPath, outPath, sampleRateKhz, encodeBitrate, encodeFormat, enableDtx, quiet, keepTemp);
         }
 
         // Decode mode: EVS -> WAV
@@ -116,10 +118,10 @@ class Program
         string? outputPath = positional.Count > 1 ? positional[1] : null;
 
         if (Directory.Exists(inputPath))
-            return ProcessDirectory(inputPath, outputPath, sampleRateKhz, quiet, keepTemp);
+            return await ProcessDirectoryAsync(inputPath, outputPath, sampleRateKhz, quiet, keepTemp);
 
         outputPath ??= Path.ChangeExtension(inputPath, ".wav");
-        return ProcessFile(inputPath, outputPath, sampleRateKhz, quiet, keepTemp);
+        return await ProcessFileAsync(inputPath, outputPath, sampleRateKhz, quiet, keepTemp);
     }
 
     #region ToC Parsing — ключевая логика
@@ -338,7 +340,7 @@ class Program
 
     #region Process files
 
-    static int ProcessDirectory(string inputDir, string? outputDir, int sampleRateKhz, bool quiet, bool keepTemp)
+    static async Task<int> ProcessDirectoryAsync(string inputDir, string? outputDir, int sampleRateKhz, bool quiet, bool keepTemp)
     {
         var files = Directory.GetFiles(inputDir)
             .Where(f => Path.GetExtension(f).ToLowerInvariant() is not (".wav" or ".pcm" or ".txt" or ".md" or ".exe" or ".dll"))
@@ -354,17 +356,17 @@ class Program
         {
             string wavPath = Path.Combine(outputDir, Path.GetFileNameWithoutExtension(file) + ".wav");
             Console.WriteLine($"\n--- {Path.GetFileName(file)} ---");
-            if (ProcessFile(file, wavPath, sampleRateKhz, quiet, keepTemp) == 0) ok++; else fail++;
+            if (await ProcessFileAsync(file, wavPath, sampleRateKhz, quiet, keepTemp) == 0) ok++; else fail++;
         }
         Console.WriteLine($"\nИтого: {ok} OK, {fail} ошибок из {files.Count}");
         return fail > 0 ? 1 : 0;
     }
 
-    static int ProcessFile(string inputPath, string outputPath, int sampleRateKhz, bool quiet, bool keepTemp)
+    static async Task<int> ProcessFileAsync(string inputPath, string outputPath, int sampleRateKhz, bool quiet, bool keepTemp)
     {
         if (!File.Exists(inputPath)) { Error($"Файл не найден: {inputPath}"); return 1; }
 
-        byte[] inputData = File.ReadAllBytes(inputPath);
+        byte[] inputData = await File.ReadAllBytesAsync(inputPath);
         if (!quiet)
         {
             Console.WriteLine($"Вход: {inputPath} ({inputData.Length:N0} байт)");
@@ -381,9 +383,9 @@ class Program
 
             pcmData = format switch
             {
-                "evs-toc" => DecodeEvsToc(inputData, sampleRateKhz, quiet, keepTemp),
-                "mime" => RunDecoder(inputData, sampleRateKhz, isMime: true, keepTemp),
-                "g192" => RunDecoder(inputData, sampleRateKhz, isMime: false, keepTemp),
+                "evs-toc" => await DecodeEvsTocAsync(inputData, sampleRateKhz, quiet, keepTemp),
+                "mime" => await RunDecoderAsync(inputData, sampleRateKhz, isMime: true, keepTemp),
+                "g192" => await RunDecoderAsync(inputData, sampleRateKhz, isMime: false, keepTemp),
                 _ => throw new Exception($"Не удалось определить формат файла. Используйте --probe для анализа.")
             };
         }
@@ -392,7 +394,7 @@ class Program
         if (pcmData is not { Length: > 0 }) { Error("Декодирование не дало результата"); return 1; }
 
         byte[] wavData = PcmToWav(pcmData, sampleRateKhz * 1000);
-        File.WriteAllBytes(outputPath, wavData);
+        await File.WriteAllBytesAsync(outputPath, wavData);
 
         double duration = (double)pcmData.Length / (sampleRateKhz * 1000 * 2);
         Console.WriteLine($"Выход: {outputPath} ({wavData.Length:N0} байт, {TimeSpan.FromSeconds(duration):mm\\:ss\\.f})");
@@ -400,7 +402,7 @@ class Program
         return 0;
     }
 
-    static byte[] DecodeEvsToc(byte[] inputData, int sampleRateKhz, bool quiet, bool keepTemp)
+    static async Task<byte[]> DecodeEvsTocAsync(byte[] inputData, int sampleRateKhz, bool quiet, bool keepTemp)
     {
         var (frameCount, frames) = ParseTocFrames(inputData);
         if (frameCount == 0)
@@ -415,13 +417,13 @@ class Program
         }
 
         if (segments.Count == 1)
-            return RunDecoder(BuildMimeFromFrames(inputData, segments[0]), sampleRateKhz, isMime: true, keepTemp);
+            return await RunDecoderAsync(BuildMimeFromFrames(inputData, segments[0]), sampleRateKhz, isMime: true, keepTemp);
 
         using var pcmOut = new MemoryStream();
         foreach (var seg in segments)
         {
             byte[] mime = BuildMimeFromFrames(inputData, seg);
-            byte[] pcm = RunDecoder(mime, sampleRateKhz, isMime: true, keepTemp);
+            byte[] pcm = await RunDecoderAsync(mime, sampleRateKhz, isMime: true, keepTemp);
             pcmOut.Write(pcm, 0, pcm.Length);
         }
         return pcmOut.ToArray();
@@ -431,7 +433,7 @@ class Program
 
     #region Encode files
 
-    static int EncodeDirectory(string inputDir, string? outputDir, int sampleRateKhz, int bitrate, string? format, bool quiet, bool keepTemp)
+    static async Task<int> EncodeDirectoryAsync(string inputDir, string? outputDir, int sampleRateKhz, int bitrate, string? format, bool quiet, bool keepTemp)
     {
         var files = Directory.GetFiles(inputDir)
             .Where(f => Path.GetExtension(f).ToLowerInvariant() is ".wav")
@@ -447,17 +449,17 @@ class Program
         {
             string evsPath = Path.Combine(outputDir, Path.GetFileNameWithoutExtension(file) + ".evs");
             Console.WriteLine($"\n--- {Path.GetFileName(file)} ---");
-            if (EncodeFile(file, evsPath, sampleRateKhz, bitrate, format, null, quiet, keepTemp) == 0) ok++; else fail++;
+            if (await EncodeFileAsync(file, evsPath, sampleRateKhz, bitrate, format, null, quiet, keepTemp) == 0) ok++; else fail++;
         }
         Console.WriteLine($"\nИтого: {ok} OK, {fail} ошибок из {files.Count}");
         return fail > 0 ? 1 : 0;
     }
 
-    static int EncodeFile(string inputPath, string outputPath, int sampleRateKhz, int bitrate, string? format, bool? enableDtx, bool quiet, bool keepTemp)
+    static async Task<int> EncodeFileAsync(string inputPath, string outputPath, int sampleRateKhz, int bitrate, string? format, bool? enableDtx, bool quiet, bool keepTemp)
     {
         if (!File.Exists(inputPath)) { Error($"Файл не найден: {inputPath}"); return 1; }
 
-        byte[] inputData = File.ReadAllBytes(inputPath);
+        byte[] inputData = await File.ReadAllBytesAsync(inputPath);
         if (!quiet)
         {
             Console.WriteLine($"Вход: {inputPath} ({inputData.Length:N0} байт)");
@@ -494,7 +496,7 @@ class Program
             // DTX (-dtx) даёт SID; без нормализации Sprut-парсер часто видит NO_DATA в «нулевых» паузах.
             // Для --format toc по умолчанию без DTX (как стабильный Sprut 24.4k); SID: явно --dtx.
             bool useDtx = enableDtx ?? false;
-            byte[] evsData = RunEncoder(pcmData, fs, bitrate, useMime, useDtx, keepTemp);
+            byte[] evsData = await RunEncoderAsync(pcmData, fs, bitrate, useMime, useDtx, keepTemp);
 
             if (outFmt == "toc")
             {
@@ -508,7 +510,7 @@ class Program
                 }
             }
 
-            File.WriteAllBytes(outputPath, evsData);
+            await File.WriteAllBytesAsync(outputPath, evsData);
 
             double duration = (double)pcmData.Length / (wavSampleRate * 2);
             Console.WriteLine($"Выход: {outputPath} ({evsData.Length:N0} байт, {TimeSpan.FromSeconds(duration):mm\\:ss\\.f})");
@@ -688,7 +690,98 @@ class Program
     /// <summary>
     /// Runs EVS encoder (EVS_cod.exe) and returns encoded bitstream
     /// </summary>
-    static byte[] RunEncoder(byte[] pcmData, int sampleRateKhz, int bitrate, bool useMime, bool enableDtx, bool keepTemp)
+    static async Task<byte[]> RunEncoderAsync(byte[] pcmData, int sampleRateKhz, int bitrate, bool useMime, bool enableDtx, bool keepTemp)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return RunEncoderLegacy(pcmData, sampleRateKhz, bitrate, useMime, enableDtx, keepTemp);
+        }
+
+        string id = Guid.NewGuid().ToString("N")[..8];
+        string inPipeName = $"evs_enc_in_{id}";
+        string outPipeName = $"evs_enc_out_{id}";
+
+        string inPipePath = $@"\\.\pipe\{inPipeName}";
+        string outPipePath = $@"\\.\pipe\{outPipeName}";
+
+        using var inPipe = new NamedPipeServerStream(inPipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        using var outPipe = new NamedPipeServerStream(outPipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+
+        var encArgs = new List<string>();
+        if (useMime) encArgs.Add("-mime");
+        if (enableDtx) encArgs.Add("-dtx");
+        encArgs.Add($"-q {bitrate}");
+        encArgs.Add(sampleRateKhz.ToString());
+        encArgs.Add($"\"{inPipePath}\"");
+        encArgs.Add($"\"{outPipePath}\"");
+        string arguments = string.Join(' ', encArgs);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = _encoderPath!,
+            Arguments = arguments,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var proc = new Process { StartInfo = psi };
+        proc.Start();
+
+        var writeTask = Task.Run(async () =>
+        {
+            try
+            {
+                await inPipe.WaitForConnectionAsync();
+                await inPipe.WriteAsync(pcmData);
+                await inPipe.FlushAsync();
+            }
+            finally
+            {
+                inPipe.Disconnect();
+            }
+        });
+
+        var readTask = Task.Run(async () =>
+        {
+            try
+            {
+                await outPipe.WaitForConnectionAsync();
+                using var ms = new MemoryStream();
+                await outPipe.CopyToAsync(ms);
+                return ms.ToArray();
+            }
+            finally
+            {
+                outPipe.Disconnect();
+            }
+        });
+
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+
+        await Task.WhenAll(writeTask, readTask);
+
+        if (!proc.WaitForExit(120_000))
+        {
+            proc.Kill();
+            throw new Exception("Encoder timeout 120s");
+        }
+
+        string stderr = await stderrTask;
+
+        if (proc.ExitCode != 0)
+        {
+            string err = string.Join("; ", stderr.Split('\n').Select(l => l.Trim())
+                .Where(l => l.Length > 0 && !l.Contains("EVS Codec") && !l.StartsWith("===")));
+            throw new Exception($"Encoder exit {proc.ExitCode}: {err}");
+        }
+
+        return await readTask;
+    }
+
+    static byte[] RunEncoderLegacy(byte[] pcmData, int sampleRateKhz, int bitrate, bool useMime, bool enableDtx, bool keepTemp)
     {
         string tmpDir = Path.Combine(Path.GetTempPath(), "EvsConsole");
         Directory.CreateDirectory(tmpDir);
@@ -844,7 +937,88 @@ class Program
 
     #region EVS Decoder
 
-    static byte[] RunDecoder(byte[] data, int sampleRateKhz, bool isMime, bool keepTemp)
+    static async Task<byte[]> RunDecoderAsync(byte[] data, int sampleRateKhz, bool isMime, bool keepTemp)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return RunDecoderLegacy(data, sampleRateKhz, isMime, keepTemp);
+        }
+
+        string tmpDir = Path.Combine(Path.GetTempPath(), "EvsConsole");
+        Directory.CreateDirectory(tmpDir);
+
+        string id = Guid.NewGuid().ToString("N")[..8];
+        string inputFile = Path.Combine(tmpDir, $"{id}{(isMime ? ".evs" : ".192")}");
+
+        string outPipeName = $"evs_dec_out_{id}";
+        string outPipePath = $@"\\.\pipe\{outPipeName}";
+
+        using var outPipe = new NamedPipeServerStream(outPipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+
+        try
+        {
+            await File.WriteAllBytesAsync(inputFile, data);
+
+            var arguments = isMime
+                ? $"-mime -q {sampleRateKhz} \"{inputFile}\" \"{outPipePath}\""
+                : $"-q {sampleRateKhz} \"{inputFile}\" \"{outPipePath}\"";
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = _decoderPath,
+                Arguments = arguments,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+
+            using var proc = new Process { StartInfo = psi };
+            proc.Start();
+
+            var readTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await outPipe.WaitForConnectionAsync();
+                    using var ms = new MemoryStream();
+                    await outPipe.CopyToAsync(ms);
+                    return ms.ToArray();
+                }
+                finally
+                {
+                    outPipe.Disconnect();
+                }
+            });
+
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+
+            byte[] pcm = await readTask;
+
+            if (!proc.WaitForExit(120_000))
+            {
+                proc.Kill();
+                throw new Exception("Decoder timeout 120s");
+            }
+
+            string stderr = await stderrTask;
+            await stdoutTask;
+
+            if (TryAcceptDecoderPcm(proc.ExitCode, pcm, sampleRateKhz, stderr, out byte[] accepted))
+                return accepted;
+            if (pcm.Length == 0)
+                throw new Exception("Decoder output empty");
+            throw new Exception($"Decoder exit {proc.ExitCode}: {SummarizeProcessError(stderr)}");
+        }
+        finally
+        {
+            if (!keepTemp) TryDelete(inputFile);
+            else Console.WriteLine($"  Temp: {inputFile}");
+        }
+    }
+
+    static byte[] RunDecoderLegacy(byte[] data, int sampleRateKhz, bool isMime, bool keepTemp)
     {
         string tmpDir = Path.Combine(Path.GetTempPath(), "EvsConsole");
         Directory.CreateDirectory(tmpDir);
@@ -883,18 +1057,17 @@ class Program
             }
 
             string stderr = stderrTask.GetAwaiter().GetResult();
+            stdoutTask.GetAwaiter().GetResult();
 
-            if (proc.ExitCode != 0)
-            {
-                string err = string.Join("; ", stderr.Split('\n').Select(l => l.Trim())
-                    .Where(l => l.Length > 0 && !l.Contains("EVS Codec") && !l.StartsWith("===")));
-                throw new Exception($"Decoder exit {proc.ExitCode}: {err}");
-            }
+            if (!File.Exists(outputFile))
+                throw new Exception($"Decoder exit {proc.ExitCode}: {SummarizeProcessError(stderr)}");
 
-            if (!File.Exists(outputFile)) throw new Exception("Decoder produced no output");
             byte[] pcm = File.ReadAllBytes(outputFile);
-            if (pcm.Length == 0) throw new Exception("Decoder output empty");
-            return pcm;
+            if (TryAcceptDecoderPcm(proc.ExitCode, pcm, sampleRateKhz, stderr, out byte[] accepted))
+                return accepted;
+            if (pcm.Length == 0)
+                throw new Exception("Decoder output empty");
+            throw new Exception($"Decoder exit {proc.ExitCode}: {SummarizeProcessError(stderr)}");
         }
         finally
         {
@@ -969,6 +1142,44 @@ class Program
 
     static void Error(string msg) => Console.Error.WriteLine($"ОШИБКА: {msg}");
     static void TryDelete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
+
+    /// <summary>
+    /// evs_dec при битом хвостовом ToC уже записал PCM и выходит с -1. Такой вывод оставляем.
+    /// </summary>
+    static bool TryAcceptDecoderPcm(int exitCode, byte[] pcm, int sampleRateKhz, string stderr, out byte[] accepted)
+    {
+        accepted = pcm;
+        if (pcm.Length < 2)
+            return false;
+
+        int even = pcm.Length & ~1;
+        if (even != pcm.Length)
+            accepted = pcm.AsSpan(0, even).ToArray();
+
+        if (exitCode == 0)
+            return true;
+
+        int minBytes = sampleRateKhz * 40;
+        if (accepted.Length < minBytes)
+            return false;
+
+        double sec = accepted.Length / (sampleRateKhz * 2000.0);
+        Console.WriteLine($"EVS: декодер код {exitCode}, оставлен PCM {sec:0.00} с ({SummarizeProcessError(stderr)})");
+        return true;
+    }
+
+    static string SummarizeProcessError(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return "";
+        var lines = text.Split('\n').Select(l => l.Trim())
+            .Where(l => l.Length > 0 && !l.Contains("EVS Codec") && !l.StartsWith("===") && !l.StartsWith("Version "));
+        var joined = string.Join("; ", lines);
+        int idx = joined.IndexOf("Error in", StringComparison.Ordinal);
+        if (idx >= 0)
+            joined = joined[idx..];
+        return joined.Length <= 180 ? joined : joined[..180];
+    }
 
     static void PrintUsage() => Console.WriteLine("""
         EVS Codec Converter (EVS <-> WAV)
